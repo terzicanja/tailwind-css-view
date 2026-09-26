@@ -5,6 +5,8 @@ export interface TailwindElement {
   startLine: number;
   endLine: number;
   classNames: string[];
+  classNameStart: number;
+  classNameEnd: number;
 }
 
 export function parseTsx(sourceText: string): TailwindElement[] {
@@ -26,11 +28,14 @@ export function parseTsx(sourceText: string): TailwindElement[] {
           node.getStart(sourceFile),
         );
         const end = sourceFile.getLineAndCharacterOfPosition(node.getEnd());
+        const classNameRange = getClassNameRange(node, sourceFile);
         elements.push({
           tagName: getTagName(node.tagName, sourceFile),
           startLine: start.line,
           endLine: end.line,
           classNames,
+          classNameStart: classNameRange.start,
+          classNameEnd: classNameRange.end,
         });
       }
     }
@@ -63,6 +68,29 @@ function getStaticClassNames(
   }
 
   return undefined;
+}
+
+function getClassNameRange(
+  node: ts.JsxOpeningElement | ts.JsxSelfClosingElement,
+  sourceFile: ts.SourceFile,
+): { start: number; end: number } {
+  for (const property of node.attributes.properties) {
+    if (!ts.isJsxAttribute(property)) {
+      continue;
+    }
+    if (getAttributeName(property) !== "className") {
+      continue;
+    }
+    const initializer = property.initializer;
+    if (initializer && ts.isStringLiteral(initializer)) {
+      return {
+        start: initializer.getStart(sourceFile) + 1,
+        end: initializer.getEnd() - 1,
+      };
+    }
+  }
+
+  return { start: -1, end: -1 };
 }
 
 function getAttributeName(attribute: ts.JsxAttribute): string {

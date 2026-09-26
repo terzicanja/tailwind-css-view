@@ -1,181 +1,43 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
+import {
+  type CssBlockChange,
+  detectCssDeclarationChanges,
+} from "../css/detectCssChanges";
+import { buildCssBlocks, sliceLines } from "../editor/buildCssBlocks";
+import { MemoryFileSystem } from "../editor/editableDiffDocument";
+import {
+  showAnchorEditWarning,
+  showCssChangeFeedback,
+} from "../editor/showCssChangeFeedback";
+import {
+  type LineChange,
+  type TailwindCssBlock,
+  applyLineChangesToBlocks,
+  changeTouchesAnchor,
+  findBlocksTouchedByChange,
+} from "../editor/trackCssBlocks";
 import { parseTsx } from "../parser/parseTsx";
-import { resolveTailwindClasses } from "../tailwind/resolveTailwindClasses";
+import {
+  type ResolvedUtilityCss,
+  resolveTailwindClasses,
+} from "../tailwind/resolveTailwindClasses";
 import { renderSemanticDiffDocument } from "./renderSemanticDiffDocument";
 
 const POC_SCHEME = "tailwind-css-view-diff-poc";
 
-/**
- * In-memory FileSystemProvider backing the editable right-hand POC document.
- * TextDocumentContentProvider cannot be used here because those documents
- * are read-only. Untitled documents are editable, but VS Code treats them
- * as unsaved files and a Save can write into the user's project. A custom
- * scheme stays out of the workspace and never touches disk.
- */
-class MemoryFileSystem implements vscode.FileSystemProvider, vscode.Disposable {
-  private readonly files = new Map<
-    string,
-    { data: Uint8Array; ctime: number; mtime: number }
-  >();
-  private readonly emitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
-
-  readonly onDidChangeFile = this.emitter.event;
-
-  writeDocument(uri: vscode.Uri, text: string): void {
-    this.writeFile(uri, new TextEncoder().encode(text), {
-      create: true,
-      overwrite: true,
-    });
-  }
-
-  watch(
-    _uri: vscode.Uri,
-    _options: { readonly recursive: boolean; readonly excludes: readonly string[] },
-  ): vscode.Disposable {
-    return new vscode.Disposable(() => {});
-  }
-
-  stat(uri: vscode.Uri): vscode.FileStat {
-    const file = this.files.get(uri.path);
-    if (file) {
-      return {
-        type: vscode.FileType.File,
-        ctime: file.ctime,
-        mtime: file.mtime,
-        size: file.data.byteLength,
-      };
-    }
-
-    if (this.hasDirectory(uri.path)) {
-      return {
-        type: vscode.FileType.Directory,
-        ctime: 0,
-        mtime: 0,
-        size: 0,
-      };
-    }
-
-    throw vscode.FileSystemError.FileNotFound(uri);
-  }
-
-  readDirectory(uri: vscode.Uri): [string, vscode.FileType][] {
-    const prefix = uri.path === "/" || uri.path === "" ? "/" : `${uri.path.replace(/\/$/, "")}/`;
-    const entries = new Map<string, vscode.FileType>();
-
-    for (const path of this.files.keys()) {
-      if (prefix === "/") {
-        const name = path.replace(/^\//, "").split("/")[0];
-        if (name) {
-          entries.set(
-            name,
-            path === `/${name}` ? vscode.FileType.File : vscode.FileType.Directory,
-          );
-        }
-        continue;
-      }
-
-      if (!path.startsWith(prefix)) {
-        continue;
-      }
-
-      const rest = path.slice(prefix.length);
-      const name = rest.split("/")[0];
-      if (name) {
-        entries.set(
-          name,
-          rest.includes("/") ? vscode.FileType.Directory : vscode.FileType.File,
-        );
-      }
-    }
-
-    return [...entries.entries()];
-  }
-
-  createDirectory(_uri: vscode.Uri): void {}
-
-  readFile(uri: vscode.Uri): Uint8Array {
-    const file = this.files.get(uri.path);
-    if (!file) {
-      throw vscode.FileSystemError.FileNotFound(uri);
-    }
-    return file.data;
-  }
-
-  writeFile(
-    uri: vscode.Uri,
-    content: Uint8Array,
-    options: { readonly create: boolean; readonly overwrite: boolean },
-  ): void {
-    const existing = this.files.get(uri.path);
-    if (!existing && !options.create) {
-      throw vscode.FileSystemError.FileNotFound(uri);
-    }
-    if (existing && !options.overwrite) {
-      throw vscode.FileSystemError.FileExists(uri);
-    }
-
-    const now = Date.now();
-    this.files.set(uri.path, {
-      data: content,
-      ctime: existing?.ctime ?? now,
-      mtime: now,
-    });
-    this.emitter.fire([
-      {
-        type: existing
-          ? vscode.FileChangeType.Changed
-          : vscode.FileChangeType.Created,
-        uri,
-      },
-    ]);
-  }
-
-  delete(uri: vscode.Uri): void {
-    if (!this.files.delete(uri.path)) {
-      throw vscode.FileSystemError.FileNotFound(uri);
-    }
-    this.emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
-  }
-
-  rename(
-    oldUri: vscode.Uri,
-    newUri: vscode.Uri,
-    options: { readonly overwrite: boolean },
-  ): void {
-    const file = this.files.get(oldUri.path);
-    if (!file) {
-      throw vscode.FileSystemError.FileNotFound(oldUri);
-    }
-    this.writeFile(newUri, file.data, {
-      create: true,
-      overwrite: options.overwrite,
-    });
-    this.delete(oldUri);
-  }
-
-  dispose(): void {
-    this.emitter.dispose();
-  }
-
-  private hasDirectory(path: string): boolean {
-    if (path === "/" || path === "") {
-      return true;
-    }
-
-    const prefix = path.endsWith("/") ? path : `${path}/`;
-    for (const filePath of this.files.keys()) {
-      if (filePath === path || filePath.startsWith(prefix)) {
-        return true;
-      }
-    }
-
-    return false;
-  }
+interface DiffPocSession {
+  rightUri: vscode.Uri;
+  sourceUri: vscode.Uri;
+  blocks: TailwindCssBlock[];
+  lastText: string;
+  lastChanges: CssBlockChange[];
+  restoring: boolean;
 }
 
 export function registerDiffPoc(context: vscode.ExtensionContext): void {
   const fileSystem = new MemoryFileSystem();
+  let session: DiffPocSession | undefined;
 
   context.subscriptions.push(fileSystem);
   context.subscriptions.push(
@@ -186,27 +48,10 @@ export function registerDiffPoc(context: vscode.ExtensionContext): void {
   );
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((event) => {
-      if (event.document.uri.scheme !== POC_SCHEME) {
+      if (!session || event.document.uri.toString() !== session.rightUri.toString()) {
         return;
       }
-
-      console.log("[Tailwind Diff POC] right-side document changed", {
-        uri: event.document.uri.toString(),
-        changeCount: event.contentChanges.length,
-        version: event.document.version,
-      });
-    }),
-  );
-  context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument((document) => {
-      if (document.uri.scheme !== POC_SCHEME) {
-        return;
-      }
-
-      console.log("[Tailwind Diff POC] right-side document saved", {
-        uri: document.uri.toString(),
-        version: document.version,
-      });
+      void handleRightDocumentChange(event, session);
     }),
   );
   context.subscriptions.push(
@@ -228,18 +73,18 @@ export function registerDiffPoc(context: vscode.ExtensionContext): void {
           : (vscode.workspace.getWorkspaceFolder(sourceUri)?.uri.fsPath ??
             process.cwd());
 
-      let cssLinesByElement: string[][];
+      let utilitiesByElement: ResolvedUtilityCss[][];
       try {
         const classNames = elements.flatMap((element) => element.classNames);
         const resolved = await resolveTailwindClasses(classNames, workspaceRoot);
         let offset = 0;
-        cssLinesByElement = elements.map((element) => {
+        utilitiesByElement = elements.map((element) => {
           const slice = resolved.utilities.slice(
             offset,
             offset + element.classNames.length,
           );
           offset += element.classNames.length;
-          return slice.flatMap((utility) => utility.displayCss);
+          return slice;
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -247,18 +92,37 @@ export function registerDiffPoc(context: vscode.ExtensionContext): void {
         return;
       }
 
+      const cssLinesByElement = utilitiesByElement.map((utilities) =>
+        utilities.flatMap((utility) => utility.displayCss),
+      );
+      const rendered = renderSemanticDiffDocument(
+        sourceText,
+        elements,
+        cssLinesByElement,
+      );
       const rightUri = vscode.Uri.from({
         scheme: POC_SCHEME,
         path: `${sourceUri.path}.css`,
       });
 
-      fileSystem.writeDocument(
-        rightUri,
-        renderSemanticDiffDocument(sourceText, elements, cssLinesByElement),
-      );
+      fileSystem.writeDocument(rightUri, rendered.text);
 
       const document = await vscode.workspace.openTextDocument(rightUri);
       await vscode.languages.setTextDocumentLanguage(document, "css");
+
+      session = {
+        rightUri,
+        sourceUri,
+        blocks: buildCssBlocks(
+          rendered.blocks,
+          elements,
+          utilitiesByElement,
+          sourceUri.toString(),
+        ),
+        lastText: document.getText(),
+        lastChanges: [],
+        restoring: false,
+      };
 
       const fileName = sourceUri.path.split("/").pop() ?? "document";
       await vscode.commands.executeCommand(
@@ -269,4 +133,107 @@ export function registerDiffPoc(context: vscode.ExtensionContext): void {
       );
     }),
   );
+}
+
+async function handleRightDocumentChange(
+  event: vscode.TextDocumentChangeEvent,
+  session: DiffPocSession,
+): Promise<void> {
+  if (session.restoring) {
+    session.restoring = false;
+    session.lastText = event.document.getText();
+    return;
+  }
+
+  if (event.contentChanges.length === 0) {
+    session.lastText = event.document.getText();
+    return;
+  }
+
+  const lineChanges = event.contentChanges.map(toLineChange);
+
+  if (
+    lineChanges.some((change) =>
+      session.blocks.some((block) => changeTouchesAnchor(change, block)),
+    )
+  ) {
+    session.restoring = true;
+    const restored = await restoreDocument(event.document, session.lastText);
+    if (!restored) {
+      session.restoring = false;
+    }
+    showAnchorEditWarning();
+    return;
+  }
+
+  const touchedIds = new Set(
+    lineChanges.flatMap((change) =>
+      findBlocksTouchedByChange(session.blocks, change).map((block) => block.id),
+    ),
+  );
+  const previousBlocks = session.blocks;
+  session.blocks = applyLineChangesToBlocks(session.blocks, lineChanges);
+  const currentText = event.document.getText();
+
+  const detected: CssBlockChange[] = [];
+  for (const blockId of touchedIds) {
+    const previous = previousBlocks.find((block) => block.id === blockId);
+    const next = session.blocks.find((block) => block.id === blockId);
+    if (!previous || !next) {
+      continue;
+    }
+
+    const changes = detectCssDeclarationChanges(
+      sliceLines(
+        session.lastText,
+        previous.generated.cssStartLine,
+        previous.generated.cssEndLine,
+      ),
+      sliceLines(
+        currentText,
+        next.generated.cssStartLine,
+        next.generated.cssEndLine,
+      ),
+    );
+    if (changes.length === 0) {
+      continue;
+    }
+
+    detected.push({
+      blockId: next.id,
+      tagName: next.tagName,
+      originalClassNames: next.source.originalClassNames,
+      changes,
+    });
+  }
+
+  session.lastChanges = detected;
+  session.lastText = currentText;
+  for (const change of detected) {
+    showCssChangeFeedback(change);
+  }
+}
+
+function toLineChange(change: vscode.TextDocumentContentChangeEvent): LineChange {
+  return {
+    startLine: change.range.start.line,
+    startCharacter: change.range.start.character,
+    endLine: change.range.end.line,
+    endCharacter: change.range.end.character,
+    text: change.text,
+  };
+}
+
+async function restoreDocument(
+  document: vscode.TextDocument,
+  text: string,
+): Promise<boolean> {
+  const edit = new vscode.WorkspaceEdit();
+  const lastLine = document.lineAt(document.lineCount - 1);
+  edit.replace(
+    document.uri,
+    new vscode.Range(new vscode.Position(0, 0), lastLine.range.end),
+    text,
+  );
+  return vscode.workspace.applyEdit(edit);
 }
